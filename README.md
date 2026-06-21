@@ -1,1 +1,0 @@
-# Codevector-product-browser
