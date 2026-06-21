@@ -1,0 +1,93 @@
+"""
+Database access layer.
+
+`list_products` is the consistency-critical function in this whole project:
+it implements keyset pagination using (updated_at, id) as a composite,
+strictly-decreasing sort key, which is what gives the "no duplicates, no
+missing rows while data changes" guarantee described in the README.
+"""
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
+
+from sqlalchemy import desc, tuple_
+from sqlalchemy.orm import Session
+
+from . import models, schemas
+from .pagination import decode_cursor, encode_cursor
+
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 200
+
+
+def list_products(
+    db: Session,
+    category: Optional[str] = None,
+    cursor: Optional[str] = None,
+    limit: int = DEFAULT_LIMIT,
+) -> Tuple[List[models.Product], Optional[str], bool]:
+    limit = max(1, min(limit, MAX_LIMIT))
+
+    query = db.query(models.Product)
+
+    if category:
+        query = query.filter(models.Product.category == category)
+
+    if cursor:
+        cursor_updated_at, cursor_id = decode_cursor(cursor)
+        # Row-value comparison: WHERE (updated_at, id) < (cursor_updated_at, cursor_id)
+        # This is exactly the inequality from the assignment spec. It is a
+        # single sargable predicate that the composite index can satisfy
+        # directly — no in-memory filtering, no skipped rows.
+        query = query.filter(
+            tuple_(models.Product.updated_at, models.Product.id)
+            < (cursor_updated_at, cursor_id)
+        )
+
+    query = query.order_by(desc(models.Product.updated_at), desc(models.Product.id))
+
+    # Fetch one extra row beyond `limit` purely to learn whether a next page
+    # exists, without a separate COUNT(*) query.
+    rows = query.limit(limit + 1).all()
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+
+    next_cursor = None
+    if has_more and page_rows:
+        last = page_rows[-1]
+        next_cursor = encode_cursor(last.updated_at, last.id)
+
+    return page_rows, next_cursor, has_more
+
+
+def get_product(db: Session, product_id: int) -> Optional[models.Product]:
+    return db.query(models.Product).filter(models.Product.id == product_id).first()
+
+
+def create_product(db: Session, product: schemas.ProductCreate) -> models.Product:
+    db_product = models.Product(**product.model_dump())
+    db.add(db_product)
+    db.commit()
+    db.refresh(db_product)
+    return db_product
+
+
+def update_product(
+    db: Session, product_id: int, product: schemas.ProductUpdate
+) -> Optional[models.Product]:
+    db_product = get_product(db, product_id)
+    if not db_product:
+        return None
+
+    update_data = product.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_product, field, value)
+
+    # Belt-and-suspenders: the column also has onupdate=func.now(), but we
+    # set it explicitly too so behavior doesn't depend on the DB backend's
+    # exact onupdate handling (relevant for the SQLite test database).
+    db_product.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    db.commit()
+    db.refresh(db_product)
+    return db_product
